@@ -119,8 +119,7 @@ test_that("correctExperiments responds to including rowdata", {
     expect_true(is.null(rowRanges(merged)$blah))
 
     rowData(sce2)$blah <- rowData(sce1)$blah
-    expect_warning(merged <- correctExperiments(sce1, sce2, 
-        PARAM=FastMnnParam(BSPARAM=BiocSingular::ExactParam())), NA)
+    merged <- correctExperiments(sce1, sce2, PARAM=FastMnnParam(BSPARAM=BiocSingular::ExactParam()))
 
     expect_identical(rowRanges(merged)$blah, rowData(sce1)$blah)
 

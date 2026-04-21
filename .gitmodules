@@ -1,0 +1,3 @@
+[submodule "BiocNeighbors"]
+	path = BiocNeighbors
+	url = https://github.com/zgr2788/BiocNeighbors

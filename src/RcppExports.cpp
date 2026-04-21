@@ -5,6 +5,11 @@
 
 using namespace Rcpp;
 
+#ifdef RCPP_USE_GLOBAL_ROSTREAM
+Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
+Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
+#endif
+
 // adjust_shift_variance
 Rcpp::NumericVector adjust_shift_variance(Rcpp::NumericMatrix data1, Rcpp::NumericMatrix data2, Rcpp::NumericMatrix vect, double sigma2, Rcpp::IntegerVector restrict1, Rcpp::IntegerVector restrict2);
 RcppExport SEXP _batchelor_adjust_shift_variance(SEXP data1SEXP, SEXP data2SEXP, SEXP vectSEXP, SEXP sigma2SEXP, SEXP restrict1SEXP, SEXP restrict2SEXP) {

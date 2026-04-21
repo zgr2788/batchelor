@@ -43,6 +43,7 @@ code. For now, we compare:
 
 - `KmknnParam()` as the exact baseline.
 - `HnswParam()` as a graph-based approximate method.
+- `FlannKdtreeParam()` as a FLANN randomized kd-tree approximate method.
 - `NndescentParam()` as an ANN-descent approximate method.
 - `AnnoyParam()` as a forest-based approximate method.
 - `RpforestParam()` as a random projection forest approximate method.
@@ -61,21 +62,22 @@ full_benchmark_seeds <- c(101L, 202L, 303L, 404L, 505L)
 benchmark_seeds <- full_benchmark_seeds[1]
 
 method_registry <- data.frame(
-    id=c("kmknn", "hnsw", "nndescent", "annoy", "rpforest"),
-    label=c("Kmknn (exact)", "HNSW", "NN-descent", "Annoy", "RP forest"),
-    reference=c(TRUE, FALSE, FALSE, FALSE, FALSE),
+    id=c("kmknn", "hnsw", "flann_kdtree", "nndescent", "annoy", "rpforest"),
+    label=c("Kmknn (exact)", "HNSW", "FLANN kd-tree", "NN-descent", "Annoy", "RP forest"),
+    reference=c(TRUE, FALSE, FALSE, FALSE, FALSE, FALSE),
     stringsAsFactors=FALSE
 )
 method_registry$param <- I(list(
     function() KmknnParam(),
     function() HnswParam(),
+    function() FlannKdtreeParam(),
     function() NndescentParam(),
     function() AnnoyParam(),
     function() RpforestParam()
 ))
 backend_files <- file.path(
     "BiocNeighbors", "R",
-    c("KmknnParam.R", "HnswParam.R", "NndescentParam.R", "AnnoyParam.R", "RpforestParam.R")
+    c("KmknnParam.R", "HnswParam.R", "FlannKdtreeParam.R", "NndescentParam.R", "AnnoyParam.R", "RpforestParam.R")
 )
 backend_stamp <- paste(file.info(backend_files[file.exists(backend_files)])$mtime, collapse="|")
 method_cache_token <- paste(method_registry$id, method_registry$label, backend_stamp, collapse="|")

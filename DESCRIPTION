@@ -30,6 +30,8 @@ Suggests:
     BiocStyle,
     knitr,
     rmarkdown,
+    ggplot2,
+    ggrastr,
     scran,
     scater,
     bluster,

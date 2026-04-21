@@ -1,0 +1,541 @@
+---
+title: Approximate MNN correction with interchangeable BNPARAM backends
+author:
+- name: Oz Beker
+date: "`r Sys.Date()`"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+package: batchelor
+bibliography: ref.bib
+vignette: >
+  %\VignetteIndexEntry{3. Approximate MNN correction}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, echo=FALSE, results="hide", message=FALSE}
+require(knitr)
+opts_chunk$set(error=FALSE, message=FALSE, warning=FALSE, autodep=TRUE)
+```
+
+```{r setup, echo=FALSE, message=FALSE}
+library(batchelor)
+library(BiocNeighbors)
+library(scRNAseq)
+library(scuttle)
+library(scran)
+library(ggplot2)
+```
+
+# Introduction
+
+The `fastMNN()` and `mnnCorrect()` functions in `r Biocpkg("batchelor")`
+delegate nearest-neighbor search to `BiocNeighbors` through the `BNPARAM`
+argument. This makes it possible to compare exact and approximate
+nearest-neighbor backends inside the same MNN correction framework, rather than
+maintaining a separate ANN-specific correction function.
+
+This vignette is written to be extensible. All method-specific work is driven by
+a method registry near the top of the document, so future backends can be added
+by appending one new entry rather than rewriting the benchmarking or plotting
+code. For now, we compare:
+
+- `KmknnParam()` as the exact baseline.
+- `HnswParam()` as a graph-based approximate method.
+- `NndescentParam()` as an ANN-descent approximate method.
+- `AnnoyParam()` as a forest-based approximate method.
+- `RpforestParam()` as a random projection forest approximate method.
+
+This version of the vignette is set up for fast smoke testing. It focuses on
+the `fastMNN()` workflow, avoids the much slower classic `mnnCorrect()` path,
+and runs a single benchmark seed by default. The helper code is still written
+so that we can later expand back to a 5-seed summary without changing the rest
+of the notebook.
+
+All standalone figure PDFs are written to a sidecar directory so they can be
+edited later.
+
+```{r helpers, echo=FALSE}
+full_benchmark_seeds <- c(101L, 202L, 303L, 404L, 505L)
+benchmark_seeds <- full_benchmark_seeds[1]
+
+method_registry <- data.frame(
+    id=c("kmknn", "hnsw", "nndescent", "annoy", "rpforest"),
+    label=c("Kmknn (exact)", "HNSW", "NN-descent", "Annoy", "RP forest"),
+    reference=c(TRUE, FALSE, FALSE, FALSE, FALSE),
+    stringsAsFactors=FALSE
+)
+method_registry$param <- I(list(
+    function() KmknnParam(),
+    function() HnswParam(),
+    function() NndescentParam(),
+    function() AnnoyParam(),
+    function() RpforestParam()
+))
+backend_files <- file.path(
+    "BiocNeighbors", "R",
+    c("KmknnParam.R", "HnswParam.R", "NndescentParam.R", "AnnoyParam.R", "RpforestParam.R")
+)
+backend_stamp <- paste(file.info(backend_files[file.exists(backend_files)])$mtime, collapse="|")
+method_cache_token <- paste(method_registry$id, method_registry$label, backend_stamp, collapse="|")
+
+reference_id <- method_registry$id[method_registry$reference]
+stopifnot(length(reference_id) == 1L)
+
+instantiate_param <- function(method_id) {
+    method_registry$param[[match(method_id, method_registry$id)]]()
+}
+
+method_factor <- function(x) {
+    factor(x, levels=method_registry$id, labels=method_registry$label)
+}
+
+non_reference_methods <- function() {
+    method_registry$id[!method_registry$reference]
+}
+
+resolve_figure_dir <- function() {
+    input <- tryCatch(knitr::current_input(dir=TRUE), error=function(e) "")
+    if (nzchar(input)) {
+        repo_root <- dirname(dirname(normalizePath(input)))
+    } else {
+        repo_root <- normalizePath(getwd())
+    }
+    out <- Sys.getenv(
+        "BATCHELOR_APPROX_MNN_FIG_DIR",
+        unset=file.path(repo_root, "vignettes", "figures", "approx-mnn")
+    )
+    dir.create(out, recursive=TRUE, showWarnings=FALSE)
+    out
+}
+
+figure_dir <- resolve_figure_dir()
+
+point_geom <- function(...) {
+    if (requireNamespace("ggrastr", quietly=TRUE)) {
+        ggrastr::geom_point_rast(..., dpi=300, dev="cairo")
+    } else {
+        ggplot2::geom_point(...)
+    }
+}
+
+save_sidecar_pdf <- function(plot, filename, width=8, height=5) {
+    ggplot2::ggsave(
+        filename=file.path(figure_dir, filename),
+        plot=plot,
+        device=grDevices::cairo_pdf,
+        width=width,
+        height=height,
+        units="in",
+        dpi=300,
+        bg="white"
+    )
+    invisible(plot)
+}
+
+benchmark_methods <- function(method_ids, seeds, prepare_once, run_once) {
+    collected <- vector("list", length(method_ids) * length(seeds))
+    counter <- 1L
+
+    for (seed in seeds) {
+        prepared <- prepare_once(seed)
+        for (method in method_ids) {
+            set.seed(seed)
+            elapsed <- unname(system.time(
+                run_once(prepared, instantiate_param(method))
+            )[["elapsed"]])
+            collected[[counter]] <- data.frame(
+                seed=seed,
+                method=method,
+                seconds=elapsed,
+                stringsAsFactors=FALSE
+            )
+            counter <- counter + 1L
+        }
+        rm(prepared)
+        invisible(gc())
+    }
+
+    do.call(rbind, collected)
+}
+
+summarize_timings <- function(x, by) {
+    key <- x[, by, drop=FALSE]
+    mean.df <- aggregate(x$seconds, key, mean)
+    sd.df <- aggregate(x$seconds, key, stats::sd)
+    names(mean.df)[ncol(mean.df)] <- "mean.seconds"
+    names(sd.df)[ncol(sd.df)] <- "sd.seconds"
+    output <- merge(mean.df, sd.df, by=by, sort=FALSE)
+    output$sd.seconds[is.na(output$sd.seconds)] <- 0
+    output
+}
+
+make_regime_label <- function(space, dims, unit) {
+    paste0(space, " (", dims, " ", unit, if (dims == 1L) "" else "s", ")")
+}
+
+recall_per_cell <- function(approx, exact) {
+    vapply(seq_len(nrow(approx)), function(i) {
+        length(intersect(approx[i, ], exact[i, ])) / ncol(exact)
+    }, numeric(1))
+}
+
+jaccard_per_cell <- function(approx, exact) {
+    vapply(seq_len(nrow(approx)), function(i) {
+        a <- approx[i, ]
+        e <- exact[i, ]
+        length(intersect(a, e)) / length(union(a, e))
+    }, numeric(1))
+}
+
+compute_overlap_metrics <- function(data, regime_label, k.fixed=20L, k.grid=c(5L, 10L, 20L, 40L, 80L)) {
+    set.seed(999)
+    ref.fixed <- findKNN(data, k=k.fixed, BNPARAM=instantiate_param(reference_id), get.distance=FALSE)$index
+
+    dist.list <- lapply(non_reference_methods(), function(method) {
+        set.seed(999)
+        approx.fixed <- findKNN(data, k=k.fixed, BNPARAM=instantiate_param(method), get.distance=FALSE)$index
+
+        rbind(
+            data.frame(
+                regime=regime_label,
+                method=method,
+                metric="Recall@k",
+                value=recall_per_cell(approx.fixed, ref.fixed),
+                stringsAsFactors=FALSE
+            ),
+            data.frame(
+                regime=regime_label,
+                method=method,
+                metric="Jaccard@k",
+                value=jaccard_per_cell(approx.fixed, ref.fixed),
+                stringsAsFactors=FALSE
+            )
+        )
+    })
+    dist.df <- do.call(rbind, dist.list)
+
+    k.list <- lapply(k.grid, function(kk) {
+        set.seed(999)
+        ref.current <- findKNN(data, k=kk, BNPARAM=instantiate_param(reference_id), get.distance=FALSE)$index
+
+        do.call(rbind, lapply(non_reference_methods(), function(method) {
+            set.seed(999)
+            approx.current <- findKNN(data, k=kk, BNPARAM=instantiate_param(method), get.distance=FALSE)$index
+            data.frame(
+                regime=regime_label,
+                method=method,
+                k=kk,
+                metric=c("Recall@k", "Jaccard@k"),
+                mean=c(
+                    mean(recall_per_cell(approx.current, ref.current)),
+                    mean(jaccard_per_cell(approx.current, ref.current))
+                ),
+                stringsAsFactors=FALSE
+            )
+        }))
+    })
+
+    list(
+        distribution=dist.df,
+        by_k=do.call(rbind, k.list)
+    )
+}
+
+make_synth_gene_batches <- function(total_cells, ngenes=200L, shift=0.75, seed=1) {
+    set.seed(seed)
+    n_per_batch <- total_cells %/% 2L
+    centers <- rbind(
+        seq(-2, 2, length.out=ngenes),
+        c(rep(-1.25, ngenes %/% 2L), rep(1.25, ngenes - ngenes %/% 2L)),
+        c(rep(1.5, ngenes %/% 4L), rep(0, ngenes %/% 2L), rep(-1.5, ngenes - (ngenes %/% 4L + ngenes %/% 2L)))
+    )
+    batch_shift <- seq(-shift, shift, length.out=ngenes)
+
+    clust1 <- sample(seq_len(nrow(centers)), n_per_batch, replace=TRUE)
+    clust2 <- sample(seq_len(nrow(centers)), n_per_batch, replace=TRUE)
+
+    B1 <- centers[clust1, , drop=FALSE] +
+        matrix(rnorm(n_per_batch * ngenes, sd=0.6), n_per_batch, ngenes)
+    B2 <- centers[clust2, , drop=FALSE] +
+        matrix(rep(batch_shift, each=n_per_batch), n_per_batch, ngenes) +
+        matrix(rnorm(n_per_batch * ngenes, sd=0.6), n_per_batch, ngenes)
+
+    list(B1=t(B1), B2=t(B2))
+}
+```
+
+The current sidecar figure directory is:
+
+```{r figure-dir}
+normalizePath(figure_dir, winslash="/", mustWork=FALSE)
+```
+
+# Load, QC, normalization and HVG selection
+
+We follow the same preprocessing pattern as the main
+[correction vignette](correction.html), using the Zeisel and Tasic brain data
+sets from `r Biocpkg("scRNAseq")`.
+
+```{r load-data}
+sce1 <- ZeiselBrainData()
+sce2 <- TasicBrainData()
+```
+
+We apply quick quality control to both data sets.
+
+```{r qc}
+sce1 <- addPerCellQC(sce1, subsets=list(Mito=grep("mt-", rownames(sce1))))
+qc1 <- quickPerCellQC(colData(sce1), sub.fields="subsets_Mito_percent")
+sce1 <- sce1[, !qc1$discard]
+
+sce2 <- addPerCellQC(sce2, subsets=list(Mito=grep("mt_", rownames(sce2))))
+qc2 <- quickPerCellQC(colData(sce2), sub.fields="subsets_Mito_percent")
+sce2 <- sce2[, !qc2$discard]
+```
+
+We restrict to the common gene universe and perform multi-batch normalization.
+
+```{r norm}
+universe <- intersect(rownames(sce1), rownames(sce2))
+sce1 <- sce1[universe, ]
+sce2 <- sce2[universe, ]
+
+normed <- multiBatchNorm(sce1, sce2)
+sce1 <- normed[[1]]
+sce2 <- normed[[2]]
+```
+
+Finally, we choose the top 5000 highly variable genes.
+
+```{r hvgs}
+dec1 <- modelGeneVar(sce1)
+dec2 <- modelGeneVar(sce2)
+combined.dec <- combineVar(dec1, dec2)
+chosen.hvgs <- getTopHVGs(combined.dec, n=5000)
+reduced_dims <- 50L
+gene_dims_example <- length(chosen.hvgs)
+
+data.frame(
+    batch=c("Zeisel", "Tasic"),
+    cells=c(ncol(sce1), ncol(sce2))
+)
+```
+
+For neighbor-set diagnostics later on, we also precompute a shared
+cosine-normalized PCA space.
+
+```{r prepare-pcs, cache=TRUE, cache.extra=method_cache_token}
+cos1 <- cosineNorm(SummarizedExperiment::assay(sce1, "logcounts"))
+cos2 <- cosineNorm(SummarizedExperiment::assay(sce2, "logcounts"))
+pcs <- multiBatchPCA(
+    cos1, cos2,
+    subset.row=chosen.hvgs,
+    d=reduced_dims,
+    BSPARAM=BiocSingular::ExactParam()
+)
+```
+
+# Timing the methods
+
+We benchmark `fastMNN()` across all backends in the registry. The current smoke
+test uses a single seed via `benchmark_seeds`; later, this can be switched back
+to `full_benchmark_seeds` to recover 5-seed mean +/- SD summaries.
+
+```{r example-benchmarks, cache=TRUE, cache.extra=method_cache_token}
+example_timings <- benchmark_methods(
+    method_ids=method_registry$id,
+    seeds=benchmark_seeds,
+    prepare_once=function(seed) list(B1=sce1, B2=sce2),
+    run_once=function(prepared, param) {
+        invisible(fastMNN(prepared$B1, prepared$B2, subset.row=chosen.hvgs, BNPARAM=param))
+    }
+)
+example_summary <- summarize_timings(example_timings, by="method")
+example_summary$method <- method_factor(example_summary$method)
+example_summary
+```
+
+```{r example-timing-plot, fig.width=8, fig.height=4.8, fig.cap="Runtime of exact and approximate backends on the Zeisel and Tasic example data using fastMNN(). Bars show the current smoke-test summary; with one seed the SD bars collapse to zero."}
+timing_plot <- ggplot(example_summary, aes(method, mean.seconds, fill=method)) +
+    geom_col(width=0.7) +
+    geom_errorbar(
+        aes(ymin=pmax(mean.seconds - sd.seconds, 0), ymax=mean.seconds + sd.seconds),
+        width=0.15
+    ) +
+    labs(
+        x=NULL,
+        y="elapsed time (s)",
+        subtitle=paste0("Input: ", length(chosen.hvgs), " HVGs, PCA dimension = ", reduced_dims,
+            ", benchmark seeds = ", paste(benchmark_seeds, collapse=", "))
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position="none",
+        axis.text.x=element_text(angle=25, hjust=1)
+    )
+
+save_sidecar_pdf(timing_plot, "01-example-timing.pdf", width=8, height=4.8)
+timing_plot
+```
+
+# Scaling to more cells
+
+To compare scaling behavior, we generate synthetic matched batches at a range of
+total cell counts and rerun `fastMNN()` with each backend. We keep the
+synthetic gene-space dimensionality at 200 and use `d = 50` for the fastMNN PCA
+step so the benchmark remains practical to render.
+
+```{r scaling-grid}
+sizes <- c(1000L, 3000L, 10000L, 30000L, 100000L)
+synthetic_gene_dims <- 200L
+```
+
+```{r scaling-benchmarks, cache=TRUE, cache.extra=method_cache_token}
+scaling_timings <- do.call(rbind, lapply(sizes, function(total_cells) {
+    current <- benchmark_methods(
+        method_ids=method_registry$id,
+        seeds=benchmark_seeds,
+        prepare_once=function(seed) make_synth_gene_batches(total_cells, ngenes=synthetic_gene_dims, seed=seed),
+        run_once=function(prepared, param) {
+            invisible(fastMNN(prepared$B1, prepared$B2, d=reduced_dims, cos.norm=FALSE, BNPARAM=param))
+        }
+    )
+    current$total_cells <- total_cells
+    current
+}))
+scaling_summary <- summarize_timings(scaling_timings, by=c("method", "total_cells"))
+scaling_summary$method <- method_factor(scaling_summary$method)
+scaling_summary
+```
+
+```{r scaling-plot, fig.width=8, fig.height=5, fig.cap="Scaling of exact and approximate backends with increasing total cell count using fastMNN() on synthetic batches. Lines show the current smoke-test summary; with one seed the SD bars collapse to zero."}
+scaling_plot <- ggplot(
+    scaling_summary,
+    aes(total_cells, mean.seconds, colour=method, group=method)
+) +
+    geom_line(linewidth=0.8) +
+    point_geom(size=2.2) +
+    geom_errorbar(
+        aes(ymin=pmax(mean.seconds - sd.seconds, 0), ymax=mean.seconds + sd.seconds),
+        width=0
+    ) +
+    labs(
+        x="total cells",
+        y="elapsed time (s)",
+        colour="backend",
+        subtitle=paste0("Synthetic input: ", synthetic_gene_dims, " genes, fastMNN d = ", reduced_dims,
+            ", benchmark seeds = ", paste(benchmark_seeds, collapse=", "))
+    ) +
+    theme_minimal()
+
+save_sidecar_pdf(scaling_plot, "02-scaling.pdf", width=8, height=5)
+scaling_plot
+```
+
+# Approximate versus exact neighbor set comparison
+
+We now compare the exact and approximate neighbor sets directly in the shared
+PCA space used by the fast workflow. The exact reference is the backend marked
+as `reference=TRUE` in the method registry, which is currently `KmknnParam()`.
+Each approximate backend is compared against that exact reference with two
+set-overlap metrics:
+
+- `Recall@k`, the fraction of exact neighbors recovered by the approximate set.
+- `Jaccard@k`, the overlap between the exact and approximate sets divided by
+  the size of their union.
+
+We compute these metrics in the shared reduced space on the same preprocessed
+example data.
+
+```{r neighbor-spaces, cache=TRUE, cache.extra=method_cache_token}
+reduced_joint <- rbind(pcs[[1]], pcs[[2]])
+
+reduced_overlap <- compute_overlap_metrics(
+    reduced_joint,
+    regime_label=make_regime_label("Reduced space", reduced_dims, "dimension")
+)
+
+overlap_distribution <- reduced_overlap$distribution
+overlap_by_k <- reduced_overlap$by_k
+
+overlap_distribution$method <- method_factor(overlap_distribution$method)
+overlap_distribution$regime <- factor(
+    overlap_distribution$regime,
+    levels=make_regime_label("Reduced space", reduced_dims, "dimension")
+)
+overlap_distribution$metric <- factor(overlap_distribution$metric, levels=c("Recall@k", "Jaccard@k"))
+
+overlap_by_k$method <- method_factor(overlap_by_k$method)
+overlap_by_k$regime <- factor(
+    overlap_by_k$regime,
+    levels=levels(overlap_distribution$regime)
+)
+overlap_by_k$metric <- factor(overlap_by_k$metric, levels=levels(overlap_distribution$metric))
+```
+
+## Per-cell distributions
+
+```{r overlap-distribution-plot, fig.width=8.5, fig.height=4.8, fig.cap="Per-cell recall and Jaccard overlap of approximate neighbor sets against the exact Kmknn baseline at k = 20 in the shared PCA space."}
+distribution_plot <- ggplot(
+    overlap_distribution,
+    aes(method, value, fill=method)
+) +
+    geom_violin(scale="width", alpha=0.6) +
+    geom_boxplot(width=0.15, outlier.size=0.3, alpha=0.8) +
+    facet_grid(regime ~ metric) +
+    coord_cartesian(ylim=c(0, 1)) +
+    labs(x=NULL, y="per-cell overlap") +
+    theme_minimal() +
+    theme(
+        legend.position="none",
+        axis.text.x=element_text(angle=25, hjust=1)
+    )
+
+save_sidecar_pdf(distribution_plot, "03-overlap-distribution.pdf", width=8.5, height=4.8)
+distribution_plot
+```
+
+## Empirical cumulative distributions
+
+```{r overlap-ecdf-plot, fig.width=8.5, fig.height=4.8, fig.cap="Empirical cumulative distributions of per-cell recall and Jaccard overlap for the approximate backends in the shared PCA space."}
+ecdf_plot <- ggplot(
+    overlap_distribution,
+    aes(value, colour=method)
+) +
+    stat_ecdf(geom="step", linewidth=0.9) +
+    facet_grid(regime ~ metric) +
+    coord_cartesian(xlim=c(0, 1), ylim=c(0, 1)) +
+    labs(x="per-cell overlap", y="cumulative fraction of cells", colour="backend") +
+    theme_minimal()
+
+save_sidecar_pdf(ecdf_plot, "04-overlap-ecdf.pdf", width=8.5, height=4.8)
+ecdf_plot
+```
+
+## Mean overlap as a function of k
+
+```{r overlap-by-k-plot, fig.width=8.5, fig.height=4.8, fig.cap="Mean recall and Jaccard overlap across a grid of neighborhood sizes in the shared PCA space."}
+overlap_k_plot <- ggplot(
+    overlap_by_k,
+    aes(k, mean, colour=method, group=method)
+) +
+    geom_line(linewidth=0.8) +
+    point_geom(size=2.1) +
+    facet_grid(regime ~ metric) +
+    coord_cartesian(ylim=c(0, 1)) +
+    labs(x="k", y="mean overlap", colour="backend") +
+    theme_minimal()
+
+save_sidecar_pdf(overlap_k_plot, "05-overlap-by-k.pdf", width=8.5, height=4.8)
+overlap_k_plot
+```
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
+
+# References {-}

@@ -6,3 +6,11 @@
 
 proposal.pdf
 src/batchelor.dll
+.Rhistory
+.cache-r/gypsum/status/scRNAseq/zeisel-brain-2015/2023-12-14/LOCK
+*.pdf
+*.png
+*.rdx
+*.RData
+*.rdb
+/vignettes/approx-mnn_cache

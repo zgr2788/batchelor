@@ -44,6 +44,7 @@ code. For now, we compare:
 - `KmknnParam()` as the exact baseline.
 - `HnswParam()` as a graph-based approximate method.
 - `FlannKdtreeParam()` as a FLANN randomized kd-tree approximate method.
+- `FlannKmeansParam()` as a FLANN hierarchical k-means approximate method.
 - `NndescentParam()` as an ANN-descent approximate method.
 - `AnnoyParam()` as a forest-based approximate method.
 - `RpforestParam()` as a random projection forest approximate method.
@@ -62,22 +63,23 @@ full_benchmark_seeds <- c(101L, 202L, 303L, 404L, 505L)
 benchmark_seeds <- full_benchmark_seeds[1]
 
 method_registry <- data.frame(
-    id=c("kmknn", "hnsw", "flann_kdtree", "nndescent", "annoy", "rpforest"),
-    label=c("Kmknn (exact)", "HNSW", "FLANN kd-tree", "NN-descent", "Annoy", "RP forest"),
-    reference=c(TRUE, FALSE, FALSE, FALSE, FALSE, FALSE),
+    id=c("kmknn", "hnsw", "flann_kdtree", "flann_kmeans", "nndescent", "annoy", "rpforest"),
+    label=c("Kmknn (exact)", "HNSW", "FLANN kd-tree", "FLANN k-means", "NN-descent", "Annoy", "RP forest"),
+    reference=c(TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE),
     stringsAsFactors=FALSE
 )
 method_registry$param <- I(list(
     function() KmknnParam(),
     function() HnswParam(),
     function() FlannKdtreeParam(),
+    function() FlannKmeansParam(),
     function() NndescentParam(),
     function() AnnoyParam(),
     function() RpforestParam()
 ))
 backend_files <- file.path(
     "BiocNeighbors", "R",
-    c("KmknnParam.R", "HnswParam.R", "FlannKdtreeParam.R", "NndescentParam.R", "AnnoyParam.R", "RpforestParam.R")
+    c("KmknnParam.R", "HnswParam.R", "FlannKdtreeParam.R", "FlannKmeansParam.R", "NndescentParam.R", "AnnoyParam.R", "RpforestParam.R")
 )
 backend_stamp <- paste(file.info(backend_files[file.exists(backend_files)])$mtime, collapse="|")
 method_cache_token <- paste(method_registry$id, method_registry$label, backend_stamp, collapse="|")
@@ -380,6 +382,53 @@ timing_plot <- ggplot(example_summary, aes(method, mean.seconds, fill=method)) +
 
 save_sidecar_pdf(timing_plot, "01-example-timing.pdf", width=8, height=4.8)
 timing_plot
+```
+
+# Corrected cells on t-SNE
+
+As in the main [correction vignette](correction.html), we can visualize the
+corrected embeddings with a $t$-SNE plot and check whether cells from the two
+batches become more intermingled after correction. Here, we do this for every
+backend in the registry on the same example data.
+
+```{r corrected-tsne-data, cache=TRUE, cache.extra=method_cache_token}
+tsne_seed <- 103L
+
+tsne_comparison <- do.call(rbind, lapply(method_registry$id, function(method) {
+    set.seed(101)
+    corrected <- fastMNN(sce1, sce2, subset.row=chosen.hvgs, BNPARAM=instantiate_param(method))
+
+    set.seed(tsne_seed)
+    corrected <- scater::runTSNE(corrected, dimred="corrected")
+    coords <- reducedDim(corrected, "TSNE")
+
+    data.frame(
+        TSNE1=coords[,1],
+        TSNE2=coords[,2],
+        batch=factor(corrected$batch, labels=c("Zeisel", "Tasic")),
+        method=method_factor(rep(method, nrow(coords))),
+        stringsAsFactors=FALSE
+    )
+}))
+```
+
+```{r corrected-tsne-plot, fig.width=9.5, fig.height=7.5, fig.cap="t-SNE plots of the fastMNN-corrected embeddings for each backend on the Zeisel and Tasic example data. Cells are colored by batch of origin."}
+tsne_plot <- ggplot(
+    tsne_comparison,
+    aes(TSNE1, TSNE2, colour=batch)
+) +
+    point_geom(size=0.5, alpha=0.6) +
+    facet_wrap(~ method, ncol=3) +
+    labs(
+        x="t-SNE 1",
+        y="t-SNE 2",
+        colour="batch",
+        subtitle=paste0("Example data, fastMNN corrected space, t-SNE seed = ", tsne_seed)
+    ) +
+    theme_minimal()
+
+save_sidecar_pdf(tsne_plot, "06-corrected-tsne.pdf", width=9.5, height=7.5)
+tsne_plot
 ```
 
 # Scaling to more cells

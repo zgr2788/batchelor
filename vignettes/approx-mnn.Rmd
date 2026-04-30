@@ -69,9 +69,9 @@ Set `num_cores` in the helper chunk below to control parallel execution via
 `BPPARAM=BiocParallel::MulticoreParam(workers=num_cores)`.
 
 ```{r helpers, echo=FALSE}
-num_cores <- 1L
+num_cores <- 32L
 full_benchmark_seeds <- c(101L, 202L, 303L, 404L, 505L)
-benchmark_seeds <- full_benchmark_seeds[1]
+benchmark_seeds <- full_benchmark_seeds
 
 method_registry <- data.frame(
     id=c("kmknn", "hnsw", "flann_kdtree", "flann_kmeans", "mlpack_lsh", "nndescent", "annoy", "rpforest"),
@@ -531,7 +531,7 @@ synthetic matched-batch benchmark, which keeps the gene dimension fixed and
 makes it easier to see when approximate-neighbor speedups appear.
 
 ```{r scaling-grid}
-sizes <- c(1000L, 3000L, 10000L, 30000L, 100000L)
+sizes <- c(1000L, 3000L, 10000L, 30000L, 100000L, 300000L, 900000L)
 synthetic_gene_dims <- 200L
 scaling_cache_token <- paste(
     method_cache_token,
